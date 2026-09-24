@@ -3,3 +3,10 @@ __pycache__/
 .Python
 *.egg-info/
 .venv/
+*.sqlite
+*.sqlite-journal
+examples/design_benchmark_t_ot_under400AAs.csv
+examples/fusondb/uniprot_query/raw_results
+examples/fusondb/uniprot_query/fusondb_catalog.sqlite
+examples/fusondb/uniprot_query/***.csv
+examples/fusondb/uniprot_query/***.txt

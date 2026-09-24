@@ -88,6 +88,33 @@ are accepted as aliases (for example, `EML4::ALK` enables `EML4:*` and `ALK:*`).
 **Gradio**: after **Generate report**, use the **Residue query** panel
 (fusion dropdown + textbox).
 
+## FusOn-DB catalog
+
+Known fusion oncoproteins live in a SQLite catalog. Sequences are stored once. Each pairing is an integer link from a
+FusOn-DB oncoprotein to one head UniProt entry and one tail UniProt entry.
+`both_reviewed = 1` is the priority set (reviewed head and reviewed tail).
+
+Build it from `examples/fusondb/assemble.ipynb`, or:
+
+```bash
+python fusondb_catalog.py
+```
+
+The Gradio app's **Known fusions** tab searches that catalog by fusion name
+(`A1BG::FGA`), gene symbol, or FusOn-DB id (`seq1`).
+
+Store breakpoint results in the same database. The job resumes wherever it
+left off:
+
+```bash
+python run_fusondb_alignments.py --reviewed-only
+python run_fusondb_alignments.py
+```
+
+`--reviewed-only` aligns the priority set first. Each oncoprotein runs
+Smith–Waterman once per distinct head sequence and once per distinct tail
+sequence, then reuses those hits for every pairing.
+
 ## Python API (brief)
 
 ```python

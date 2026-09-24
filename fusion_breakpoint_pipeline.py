@@ -247,9 +247,24 @@ def find_fusion_breakpoint(
         gap=gap,
     )
 
-    best_result: Optional[FusionBreakpointResult] = None
+    return choose_breakpoint(
+        head_best,
+        tail_best,
+        inter_fragment_gap_penalty=inter_fragment_gap_penalty,
+    )
 
-    for k in range(len(fusion) - 1):
+
+def choose_breakpoint(head_best, tail_best, inter_fragment_gap_penalty: int = 1):
+    """Pick the best head/tail breakpoint from precomputed per-position hits.
+
+    ``head_best[k]`` is the best head hit ending at or before fusion index k.
+    ``tail_best[k]`` is the best tail hit starting at or after fusion index k.
+    Both lists are the length of the fusion sequence.
+    """
+    best_result: Optional[FusionBreakpointResult] = None
+    n_positions = min(len(head_best), len(tail_best))
+
+    for k in range(n_positions - 1):
         h = head_best[k]
         t = tail_best[k + 1]
 

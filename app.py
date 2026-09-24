@@ -11,6 +11,13 @@ from fusion_breakpoint_pipeline import (
     query_residue,
     run_fusion_breakpoint_batch,
 )
+from fusondb_catalog import (
+    alignment_html,
+    default_catalog_path,
+    get_pairing,
+    open_catalog,
+    search_pairings,
+)
 
 
 EXAMPLE_FUSION_NAME = "LASP1::RBX1"
@@ -167,6 +174,107 @@ def _restyle_html_colors(html_text: str, old_colors: dict, new_colors: dict) -> 
 
 def load_single_example():
     return EXAMPLE_FUSION_NAME, EXAMPLE_FUSION, EXAMPLE_HEAD, EXAMPLE_TAIL
+
+
+def _pairing_choice_label(row) -> str:
+    status = row.alignment_status if pd.notna(row.alignment_status) else "not aligned"
+    return (
+        f"{int(row.pairing_id)} | {row.seq_id} | "
+        f"{row.head_uniprot_id} × {row.tail_uniprot_id} | {status}"
+    )
+
+
+def search_known_fusions(query, reviewed_only):
+    empty = pd.DataFrame()
+    path = default_catalog_path()
+    if not path.exists():
+        return (
+            f"Catalog not built yet. Expected `{path}`.",
+            empty,
+            gr.update(choices=[], value=None),
+        )
+    text = str(query or "").strip()
+    if not text:
+        return (
+            "Enter a fusion (`A1BG::FGA`), a gene symbol, or a FusOn-DB id (`seq1`).",
+            empty,
+            gr.update(choices=[], value=None),
+        )
+
+    conn = open_catalog(path)
+    try:
+        found, total = search_pairings(
+            conn,
+            query=text,
+            reviewed_only=bool(reviewed_only),
+            limit=100,
+        )
+    finally:
+        conn.close()
+
+    if found.empty:
+        return (
+            f"No pairings for `{text}`.",
+            empty,
+            gr.update(choices=[], value=None),
+        )
+
+    choices = [_pairing_choice_label(row) for row in found.itertuples(index=False)]
+    summary = (
+        f"**{total:,}** pairings for `{text}`. "
+        f"Showing {len(found):,}."
+    )
+    return summary, found, gr.update(choices=choices, value=choices[0])
+
+
+def inspect_known_pairing(choice, residue_query):
+    if not choice:
+        return "Select a pairing from the search results.", ""
+    pairing_id = int(str(choice).split("|", 1)[0].strip())
+    conn = open_catalog()
+    try:
+        detail = get_pairing(conn, pairing_id)
+    finally:
+        conn.close()
+    if detail is None:
+        return f"Pairing `{pairing_id}` was not found.", ""
+
+    alignment = detail.get("alignment")
+    html = alignment_html(detail) if alignment and alignment.get("residue_maps") else ""
+    header = (
+        f"**{detail['fusiongenes']}** ({detail['seq_id']}) · "
+        f"head `{detail['head_uniprot_id']}` ({detail['head_reviewed']}) × "
+        f"tail `{detail['tail_uniprot_id']}` ({detail['tail_reviewed']})"
+    )
+    if alignment is None:
+        return (
+            header
+            + "\n\nThis pairing is in the catalog. Its breakpoint alignment has not been stored yet.",
+            "",
+        )
+    if alignment.get("status") != "ok" or not alignment.get("residue_maps"):
+        return header + f"\n\nAlignment failed: {alignment.get('error')}", ""
+
+    if not residue_query or not str(residue_query).strip():
+        return (
+            header
+            + f"\n\n- Score: `{alignment.get('score')}`"
+            + f"\n- Head in fusion: `{alignment.get('head_fusion_start_1ind')}–{alignment.get('head_fusion_end_1ind')}`"
+            + f"\n- Tail in fusion: `{alignment.get('tail_fusion_start_1ind')}–{alignment.get('tail_fusion_end_1ind')}`"
+            + f"\n- Mutations: head `{alignment.get('total_head_mutations')}`, "
+            + f"tail `{alignment.get('total_tail_mutations')}`",
+            html,
+        )
+
+    aliases = _partner_aliases_from_fusion_name(detail["fusiongenes"])
+    answer = format_residue_query_answer(
+        query_residue(
+            alignment["residue_maps"],
+            query_text=residue_query,
+            partner_aliases=aliases,
+        )
+    )
+    return header + "\n\n" + answer, html
 
 
 def run_app(
@@ -424,6 +532,49 @@ with gr.Blocks(
             head_col = gr.Textbox(label="Head sequence column", value="head")
             tail_col = gr.Textbox(label="Tail sequence column", value="tail")
 
+    with gr.Tab("Known fusions"):
+        gr.Markdown(
+            """
+            Search the FusOn-DB catalog. Each row is one fusion oncoprotein
+            paired with one head UniProt entry and one tail UniProt entry.
+            Reviewed-only is the priority set: both parents are Swiss-Prot reviewed.
+            Breakpoint coordinates and residue queries appear after that pairing
+            has been aligned and stored.
+            """
+        )
+        with gr.Row():
+            catalog_query = gr.Textbox(
+                label="Fusion, gene, or seq id",
+                placeholder="A1BG::FGA",
+                scale=3,
+            )
+            catalog_reviewed = gr.Checkbox(
+                label="Reviewed head and tail only",
+                value=True,
+            )
+            catalog_search_button = gr.Button("Search catalog", variant="primary")
+        catalog_summary = gr.Markdown()
+        catalog_table = gr.Dataframe(
+            label="Matching pairings",
+            interactive=False,
+            wrap=False,
+        )
+        catalog_choice = gr.Dropdown(
+            label="Open a pairing",
+            choices=[],
+            value=None,
+            interactive=True,
+        )
+        with gr.Row():
+            catalog_residue = gr.Textbox(
+                label="Residue query",
+                placeholder="Head:M1",
+                scale=3,
+            )
+            catalog_residue_button = gr.Button("Show alignment", variant="secondary")
+        catalog_answer = gr.Markdown()
+        catalog_html = gr.HTML()
+
     with gr.Accordion("Display options", open=False):
         with gr.Row():
             head_color = gr.ColorPicker(label="Head color", value="#dc143c")
@@ -539,6 +690,27 @@ with gr.Blocks(
         inputs=None,
         outputs=None,
         js="() => { window.location.reload(); }",
+    )
+
+    catalog_search_button.click(
+        fn=search_known_fusions,
+        inputs=[catalog_query, catalog_reviewed],
+        outputs=[catalog_summary, catalog_table, catalog_choice],
+    )
+    catalog_query.submit(
+        fn=search_known_fusions,
+        inputs=[catalog_query, catalog_reviewed],
+        outputs=[catalog_summary, catalog_table, catalog_choice],
+    )
+    catalog_residue_button.click(
+        fn=inspect_known_pairing,
+        inputs=[catalog_choice, catalog_residue],
+        outputs=[catalog_answer, catalog_html],
+    )
+    catalog_choice.change(
+        fn=inspect_known_pairing,
+        inputs=[catalog_choice, catalog_residue],
+        outputs=[catalog_answer, catalog_html],
     )
 
 
