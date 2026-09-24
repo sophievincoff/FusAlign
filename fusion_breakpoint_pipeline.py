@@ -82,7 +82,8 @@ def smith_waterman_hits_by_fusion_end(
     start = [[None] * (m + 1) for _ in range(n + 1)]
     tb = [[None] * (m + 1) for _ in range(n + 1)]
 
-    best_ending_at = [None] * m
+    # Store metadata first, then traceback once per fusion end for speed.
+    best_meta = [None] * m
 
     for i in range(1, n + 1):
         for j in range(1, m + 1):
@@ -108,29 +109,38 @@ def smith_waterman_hits_by_fusion_end(
             tb[i][j] = direction
 
             if score > 0:
-                protein_start, fusion_start = st
+                old = best_meta[j - 1]
+                if old is None or score > old["score"]:
+                    best_meta[j - 1] = {
+                        "score": score,
+                        "i_end_1ind": i,
+                        "j_end_1ind": j,
+                        "start": st,
+                    }
 
-                aligned_pairs = traceback_aligned_pairs(
-                    dp=dp,
-                    tb=tb,
-                    protein=protein,
-                    fusion=fusion,
-                    i=i,
-                    j=j,
-                )
-
-                hit = LocalHit(
-                    score=score,
-                    fusion_start=fusion_start,
-                    fusion_end=j - 1,
-                    protein_start=protein_start,
-                    protein_end=i - 1,
-                    aligned_pairs=aligned_pairs,
-                )
-
-                old = best_ending_at[j - 1]
-                if old is None or hit.score > old.score:
-                    best_ending_at[j - 1] = hit
+    best_ending_at = [None] * m
+    for j0, meta in enumerate(best_meta):
+        if meta is None:
+            continue
+        protein_start, fusion_start = meta["start"]
+        i_end_1ind = meta["i_end_1ind"]
+        j_end_1ind = meta["j_end_1ind"]
+        aligned_pairs = traceback_aligned_pairs(
+            dp=dp,
+            tb=tb,
+            protein=protein,
+            fusion=fusion,
+            i=i_end_1ind,
+            j=j_end_1ind,
+        )
+        best_ending_at[j0] = LocalHit(
+            score=meta["score"],
+            fusion_start=fusion_start,
+            fusion_end=j0,
+            protein_start=protein_start,
+            protein_end=i_end_1ind - 1,
+            aligned_pairs=aligned_pairs,
+        )
 
     return best_ending_at
 
@@ -285,6 +295,16 @@ def find_fragment_bounds(seq, frag, *, use_last=False):
     return start, end
 
 
+MUTATION_COLOR = "#7c3aed"
+
+RESIDUE_QUERY_RE = re.compile(
+    r"^\s*(?P<partner>[A-Za-z][A-Za-z0-9_.-]*)\s*[:\s]\s*"
+    r"(?:(?P<aa>[A-Za-z])\s*)?(?P<pos>\d+)"
+    r"(?:\s*(?:-|\.\.|to)\s*(?:(?P<aa_end>[A-Za-z])\s*)?(?P<pos_end>\d+))?\s*$",
+    re.IGNORECASE,
+)
+
+
 def mutations_from_hit(hit):
     """Extract parent-to-fusion mismatches from an alignment hit."""
     muts = []
@@ -305,6 +325,373 @@ def mutations_from_hit(hit):
     return muts
 
 
+def _hit_span_1ind(hit):
+    """Return 1-indexed inclusive parent and fusion spans for a hit."""
+    if hit is None:
+        return None
+    return {
+        "parent_start_1ind": hit.protein_start + 1,
+        "parent_end_1ind": hit.protein_end + 1,
+        "fusion_start_1ind": hit.fusion_start + 1,
+        "fusion_end_1ind": hit.fusion_end + 1,
+    }
+
+
+def build_residue_maps(head_hit, tail_hit):
+    """Build JSON-serializable parent↔fusion residue maps from alignment hits."""
+    maps = {
+        "head": {},
+        "tail": {},
+        "fusion": {},
+        "spans": {
+            "head": _hit_span_1ind(head_hit),
+            "tail": _hit_span_1ind(tail_hit),
+        },
+    }
+
+    for partner, hit in (("head", head_hit), ("tail", tail_hit)):
+        if hit is None:
+            continue
+        for p in hit.aligned_pairs or []:
+            parent_i = p["protein_index_0ind"] + 1
+            fusion_i = p["fusion_index_0ind"] + 1
+            entry = {
+                "partner": partner,
+                "parent_index_1ind": parent_i,
+                "fusion_index_1ind": fusion_i,
+                "parent_aa": p["protein_aa"],
+                "fusion_aa": p["fusion_aa"],
+                "is_mutation": p["protein_aa"] != p["fusion_aa"],
+            }
+            maps[partner][str(parent_i)] = entry
+            # Prefer first write; overlapping head/tail on fusion is rare for valid BP.
+            maps["fusion"].setdefault(str(fusion_i), entry)
+
+    return maps
+
+
+def _normalize_partner(partner, partner_aliases=None):
+    """Normalize partner token to head/tail/fusion, with optional alias support."""
+    norm = str(partner).strip().lower()
+    aliases = {"head": "head", "tail": "tail", "fusion": "fusion"}
+    if partner_aliases:
+        aliases.update({str(k).strip().lower(): v for k, v in partner_aliases.items()})
+    canonical = aliases.get(norm)
+    if canonical not in {"head", "tail", "fusion"}:
+        allowed = sorted(aliases.keys())
+        raise ValueError(
+            "Partner must be Head, Tail, or Fusion"
+            + (f" (or alias: {', '.join(allowed)})" if partner_aliases else "")
+            + f". Got {partner!r}."
+        )
+    return canonical
+
+
+def parse_residue_query(text, *, partner_aliases=None):
+    """
+    Parse queries like ``Tail:Y1078``, ``Tail Y1078``, ``head:45``, ``Fusion:Y450``,
+    and ranges like ``Tail:1078-1085``.
+
+    Returns dict with partner, position (1-based), and optional expected_aa.
+    """
+    if text is None or not str(text).strip():
+        raise ValueError("Empty residue query.")
+
+    match = RESIDUE_QUERY_RE.match(str(text))
+    if not match:
+        raise ValueError(
+            "Could not parse query. Examples: Tail:Y1078, Head:S12, Fusion:Y200, Tail:1078"
+        )
+
+    partner = _normalize_partner(match.group("partner"), partner_aliases=partner_aliases)
+    position = int(match.group("pos"))
+    position_end = int(match.group("pos_end")) if match.group("pos_end") else position
+    aa = match.group("aa")
+    expected_aa = aa.upper() if aa else None
+    aa_end = match.group("aa_end")
+    expected_aa_end = aa_end.upper() if aa_end else None
+    if expected_aa is not None and not expected_aa.isalpha():
+        raise ValueError(f"Invalid amino-acid letter: {aa!r}")
+    if expected_aa_end is not None and not expected_aa_end.isalpha():
+        raise ValueError(f"Invalid amino-acid letter: {aa_end!r}")
+    if position_end < position:
+        raise ValueError("Range end must be >= range start.")
+    if position_end != position and (expected_aa is not None or expected_aa_end is not None):
+        raise ValueError("For ranges, omit amino-acid letters (example: Tail:1078-1085).")
+
+    return {
+        "partner": partner,
+        "position": position,
+        "position_end": position_end,
+        "expected_aa": expected_aa,
+    }
+
+
+def format_residue_query_answer(answer):
+    """Render a query_residue() result as Markdown."""
+    status = answer.get("status")
+
+    if status == "range":
+        start = answer.get("start")
+        end = answer.get("end")
+        partner = answer.get("partner")
+        lines = [f"**Range query `{partner}:{start}-{end}`**", ""]
+        counts = answer.get("counts", {})
+        lines.append(
+            "- Summary: "
+            f"{counts.get('found', 0)} found, "
+            f"{counts.get('not_in_alignment', 0)} not in alignment, "
+            f"{counts.get('parent_aa_mismatch', 0)} amino-acid disagreements, "
+            f"{counts.get('error', 0)} errors."
+        )
+        lines.append("")
+        for item in answer.get("results", []):
+            label = item.get("query")
+            item_status = item.get("status")
+            if item_status == "found":
+                lines.append(
+                    f"- `{label}` -> {item['fusion_aa']}{item['fusion_index_1ind']} "
+                    f"(from {item['parent_aa']}{item['parent_index_1ind']})"
+                )
+            else:
+                lines.append(
+                    f"- `{label}` -> {item_status.replace('_', ' ')}: {item.get('message', '')}"
+                )
+        return "\n".join(lines)
+    if status == "found":
+        lines = [
+            f"**{answer['summary']}**",
+            "",
+            f"- Partner: `{answer['partner']}`",
+            f"- Parent: `{answer['parent_aa']}{answer['parent_index_1ind']}`",
+            f"- Fusion: `{answer['fusion_aa']}{answer['fusion_index_1ind']}`",
+            f"- Amino acid match: **{'yes' if answer['aa_matches'] else 'no'}**",
+        ]
+        if answer.get("is_mutation"):
+            lines.append("- Note: this aligned pair is a **substitution** in the fusion.")
+        if answer.get("warning"):
+            lines.append(f"- Warning: {answer['warning']}")
+        return "\n".join(lines)
+
+    if status == "not_in_alignment":
+        span = answer.get("hit_span") or {}
+        span_txt = ""
+        if span:
+            span_txt = (
+                f" Aligned `{answer.get('partner')}` span on parent is "
+                f"{span.get('parent_start_1ind')}–{span.get('parent_end_1ind')}; "
+                f"on fusion {span.get('fusion_start_1ind')}–{span.get('fusion_end_1ind')}."
+            )
+        return f"**Not in alignment.** {answer.get('message', '')}{span_txt}"
+
+    if status == "parent_aa_mismatch":
+        return (
+            f"**Parent amino acid disagreement.** {answer.get('message', '')}\n\n"
+            f"- Requested: `{answer.get('expected_aa')}{answer.get('parent_index_1ind')}`\n"
+            f"- Observed at that parent position: "
+            f"`{answer.get('parent_aa')}{answer.get('parent_index_1ind')}`\n"
+            f"- Mapped fusion site: "
+            f"`{answer.get('fusion_aa')}{answer.get('fusion_index_1ind')}`"
+        )
+
+    if status == "error":
+        return f"**Query error.** {answer.get('message', '')}"
+
+    return f"**Unexpected result:** `{answer}`"
+
+
+def _query_residue_single(maps, *, partner, position, expected_aa=None):
+    """Single-position residue query implementation."""
+    partner = str(partner).lower()
+    position = int(position)
+    if expected_aa is not None:
+        expected_aa = str(expected_aa).upper()
+
+    if partner not in {"head", "tail", "fusion"}:
+        return {
+            "status": "error",
+            "message": f"Partner must be Head, Tail, or Fusion (got {partner!r}).",
+        }
+
+    if partner in {"head", "tail"}:
+        entry = (maps.get(partner) or {}).get(str(position))
+        span = (maps.get("spans") or {}).get(partner)
+        if entry is None:
+            return {
+                "status": "not_in_alignment",
+                "partner": partner,
+                "parent_index_1ind": position,
+                "expected_aa": expected_aa,
+                "hit_span": span,
+                "message": (
+                    f"{partner.capitalize()} residue {position} is not covered by "
+                    f"the {partner} alignment hit."
+                ),
+            }
+        if expected_aa is not None and entry["parent_aa"] != expected_aa:
+            return {
+                "status": "parent_aa_mismatch",
+                "partner": partner,
+                "parent_index_1ind": entry["parent_index_1ind"],
+                "fusion_index_1ind": entry["fusion_index_1ind"],
+                "parent_aa": entry["parent_aa"],
+                "fusion_aa": entry["fusion_aa"],
+                "expected_aa": expected_aa,
+                "is_mutation": entry["is_mutation"],
+                "message": (
+                    f"Requested {expected_aa}{position}, but the {partner} sequence "
+                    f"has {entry['parent_aa']} at that position."
+                ),
+            }
+        aa_matches = expected_aa is None or entry["fusion_aa"] == expected_aa
+        warning = None
+        if expected_aa is not None and entry["fusion_aa"] != expected_aa:
+            warning = (
+                f"Fusion has {entry['fusion_aa']}{entry['fusion_index_1ind']} "
+                f"(not {expected_aa})."
+            )
+        summary = (
+            f"{partner.capitalize()} {entry['parent_aa']}{entry['parent_index_1ind']} "
+            f"-> fusion {entry['fusion_aa']}{entry['fusion_index_1ind']}"
+        )
+        return {
+            "status": "found",
+            "partner": partner,
+            "parent_index_1ind": entry["parent_index_1ind"],
+            "fusion_index_1ind": entry["fusion_index_1ind"],
+            "parent_aa": entry["parent_aa"],
+            "fusion_aa": entry["fusion_aa"],
+            "expected_aa": expected_aa,
+            "aa_matches": aa_matches,
+            "is_mutation": entry["is_mutation"],
+            "summary": summary,
+            "warning": warning,
+        }
+
+    entry = (maps.get("fusion") or {}).get(str(position))
+    if entry is None:
+        return {
+            "status": "not_in_alignment",
+            "partner": "fusion",
+            "fusion_index_1ind": position,
+            "expected_aa": expected_aa,
+            "hit_span": None,
+            "message": (
+                f"Fusion residue {position} is not covered by the head or tail "
+                f"alignment hits."
+            ),
+        }
+    if expected_aa is not None and entry["fusion_aa"] != expected_aa:
+        return {
+            "status": "parent_aa_mismatch",
+            "partner": entry["partner"],
+            "parent_index_1ind": entry["parent_index_1ind"],
+            "fusion_index_1ind": entry["fusion_index_1ind"],
+            "parent_aa": entry["parent_aa"],
+            "fusion_aa": entry["fusion_aa"],
+            "expected_aa": expected_aa,
+            "is_mutation": entry["is_mutation"],
+            "message": (
+                f"Requested fusion {expected_aa}{position}, but the fusion sequence "
+                f"has {entry['fusion_aa']} at that position."
+            ),
+        }
+    aa_matches = expected_aa is None or entry["fusion_aa"] == expected_aa
+    summary = (
+        f"Fusion {entry['fusion_aa']}{entry['fusion_index_1ind']} -> "
+        f"{entry['partner']} {entry['parent_aa']}{entry['parent_index_1ind']}"
+    )
+    return {
+        "status": "found",
+        "partner": entry["partner"],
+        "parent_index_1ind": entry["parent_index_1ind"],
+        "fusion_index_1ind": entry["fusion_index_1ind"],
+        "parent_aa": entry["parent_aa"],
+        "fusion_aa": entry["fusion_aa"],
+        "expected_aa": expected_aa,
+        "aa_matches": aa_matches,
+        "is_mutation": entry["is_mutation"],
+        "summary": summary,
+        "warning": None,
+    }
+
+
+def query_residue(
+    maps,
+    *,
+    partner=None,
+    position=None,
+    position_end=None,
+    expected_aa=None,
+    query_text=None,
+    partner_aliases=None,
+):
+    """
+    Map a residue between parent and fusion using maps from build_residue_maps().
+
+    Provide either ``query_text`` (parsed) or explicit partner/position/expected_aa.
+    """
+    try:
+        if query_text is not None:
+            parsed = parse_residue_query(query_text, partner_aliases=partner_aliases)
+            partner = parsed["partner"]
+            position = parsed["position"]
+            position_end = parsed.get("position_end", position)
+            expected_aa = parsed["expected_aa"]
+        if partner is None or position is None:
+            raise ValueError("partner and position are required.")
+        partner = _normalize_partner(partner, partner_aliases=partner_aliases)
+        position = int(position)
+        position_end = int(position if position_end is None else position_end)
+        if position_end < position:
+            raise ValueError("position_end must be >= position.")
+        if position_end != position and expected_aa is not None:
+            raise ValueError("expected_aa is only supported for single-position queries.")
+        if expected_aa is not None:
+            expected_aa = str(expected_aa).upper()
+    except ValueError as exc:
+        return {"status": "error", "message": str(exc)}
+
+    if position_end == position:
+        return _query_residue_single(
+            maps,
+            partner=partner,
+            position=position,
+            expected_aa=expected_aa,
+        )
+
+    if position_end - position + 1 > 2000:
+        return {
+            "status": "error",
+            "message": "Range is too large (>2000 residues).",
+        }
+
+    items = []
+    counts = {
+        "found": 0,
+        "not_in_alignment": 0,
+        "parent_aa_mismatch": 0,
+        "error": 0,
+    }
+    for pos in range(position, position_end + 1):
+        ans = _query_residue_single(maps, partner=partner, position=pos, expected_aa=None)
+        ans["query"] = f"{partner}:{pos}"
+        items.append(ans)
+        if ans["status"] in counts:
+            counts[ans["status"]] += 1
+        else:
+            counts["error"] += 1
+
+    return {
+        "status": "range",
+        "partner": partner,
+        "start": position,
+        "end": position_end,
+        "results": items,
+        "counts": counts,
+    }
+
+
 def mutation_list_html(muts):
     """Render mutation annotations as compact HTML."""
     if not muts:
@@ -314,45 +701,270 @@ def mutation_list_html(muts):
     return f"<span class='mutation-list'>{escape(text)}</span>"
 
 
-def color_sequence_by_positions(seq, colored_positions):
-    """Color selected 0-indexed positions in a sequence."""
+def color_sequence_by_positions(
+    seq,
+    colored_positions,
+    mutation_positions=None,
+    mutation_color=MUTATION_COLOR,
+):
+    """
+    Color selected 0-indexed positions in a sequence.
+
+    ``colored_positions`` maps index → CSS color for regional (head/tail) paint.
+    ``mutation_positions`` is a set of 0-indexed indices styled purple + underline
+    and takes priority over regional color.
+    """
+    mutation_positions = mutation_positions or set()
     pieces = []
 
     for i, aa in enumerate(seq):
-        color = colored_positions.get(i)
-        if color is None:
-            pieces.append(escape(aa))
-        else:
+        if i in mutation_positions:
             pieces.append(
-                f"<span style='color:{color}; font-weight:600'>"
+                f"<span class='mut' style='color:{mutation_color}; "
+                f"font-weight:600; text-decoration:underline'>"
                 f"{escape(aa)}"
                 f"</span>"
             )
+        else:
+            color = colored_positions.get(i)
+            if color is None:
+                pieces.append(escape(aa))
+            else:
+                pieces.append(
+                    f"<span style='color:{color}; font-weight:600'>"
+                    f"{escape(aa)}"
+                    f"</span>"
+                )
 
     return "".join(pieces)
 
 
-def color_fusion_by_hits(fusion_seq, head_hit, tail_hit, head_color, tail_color):
-    """Color fusion sequence residues covered by head and tail hits."""
+def color_fusion_by_hits(
+    fusion_seq,
+    head_hit,
+    tail_hit,
+    head_color,
+    tail_color,
+    mutation_color=MUTATION_COLOR,
+):
+    """Color fusion sequence residues; substitutions are purple + underlined."""
     colored = {}
+    mutations = set()
 
     for p in head_hit.aligned_pairs or []:
-        colored[p["fusion_index_0ind"]] = head_color
+        idx = p["fusion_index_0ind"]
+        colored[idx] = head_color
+        if p["protein_aa"] != p["fusion_aa"]:
+            mutations.add(idx)
 
     for p in tail_hit.aligned_pairs or []:
-        colored[p["fusion_index_0ind"]] = tail_color
+        idx = p["fusion_index_0ind"]
+        colored[idx] = tail_color
+        if p["protein_aa"] != p["fusion_aa"]:
+            mutations.add(idx)
 
-    return color_sequence_by_positions(fusion_seq, colored)
+    return color_sequence_by_positions(
+        fusion_seq,
+        colored,
+        mutations,
+        mutation_color=mutation_color,
+    )
 
 
-def color_parent_by_hit(parent_seq, hit, color):
-    """Color parent sequence residues covered by a hit."""
+def color_parent_by_hit(parent_seq, hit, color, mutation_color=MUTATION_COLOR):
+    """Color parent residues covered by a hit; substitutions purple + underlined."""
     colored = {}
+    mutations = set()
 
     for p in hit.aligned_pairs or []:
-        colored[p["protein_index_0ind"]] = color
+        idx = p["protein_index_0ind"]
+        colored[idx] = color
+        if p["protein_aa"] != p["fusion_aa"]:
+            mutations.add(idx)
 
-    return color_sequence_by_positions(parent_seq, colored)
+    return color_sequence_by_positions(
+        parent_seq,
+        colored,
+        mutations,
+        mutation_color=mutation_color,
+    )
+
+
+def sequence_color_legend_html(head_color, tail_color, mutation_color=MUTATION_COLOR):
+    """HTML legend for head / tail / mutation sequence coloring."""
+    return f"""
+    <div class="seq-legend">
+      <span class="legend-item">
+        <span class="legend-swatch" style="background:{escape(head_color)}"></span> Head
+      </span>
+      <span class="legend-item">
+        <span class="legend-swatch" style="background:{escape(tail_color)}"></span> Tail
+      </span>
+      <span class="legend-item">
+        <span class="legend-swatch" style="background:{escape(mutation_color)}"></span>
+        <span style="color:{escape(mutation_color)}; text-decoration:underline;">Mutation</span>
+      </span>
+    </div>
+    """
+
+
+def residue_maps_by_fusion_name(rows):
+    """Build fusion_name → residue_maps dict from analyze_one_fusion row dicts."""
+    payload = {}
+    for row in rows:
+        if row.get("status") != "ok":
+            continue
+        raw = row.get("residue_maps_json")
+        if not raw:
+            continue
+        try:
+            payload[str(row["fusion_name"])] = (
+                json.loads(raw) if isinstance(raw, str) else raw
+            )
+        except (TypeError, json.JSONDecodeError):
+            continue
+    return payload
+
+
+RESIDUE_QUERY_WIDGET_JS = r"""
+(function () {
+  function parseQuery(text) {
+    var m = /^\s*(head|tail|fusion)\s*[:\s]\s*(?:([A-Za-z])\s*)?(\d+)\s*$/i.exec(text || "");
+    if (!m) throw new Error("Could not parse query. Examples: Tail:Y1078, Head:S12, Fusion:Y200");
+    return {
+      partner: m[1].toLowerCase(),
+      expected_aa: m[2] ? m[2].toUpperCase() : null,
+      position: parseInt(m[3], 10)
+    };
+  }
+
+  function spanText(partner, span) {
+    if (!span) return "";
+    return " Aligned " + partner + " span on parent is " +
+      span.parent_start_1ind + "–" + span.parent_end_1ind +
+      "; on fusion " + span.fusion_start_1ind + "–" + span.fusion_end_1ind + ".";
+  }
+
+  function queryResidue(maps, partner, position, expectedAa) {
+    if (partner === "head" || partner === "tail") {
+      var entry = (maps[partner] || {})[String(position)];
+      var span = ((maps.spans || {})[partner]) || null;
+      if (!entry) {
+        return "Not in alignment. " + partner.charAt(0).toUpperCase() + partner.slice(1) +
+          " residue " + position + " is not covered by the " + partner + " alignment hit." +
+          spanText(partner, span);
+      }
+      if (expectedAa && entry.parent_aa !== expectedAa) {
+        return "Parent amino acid disagreement. Requested " + expectedAa + position +
+          ", but the " + partner + " sequence has " + entry.parent_aa + " at that position.\n" +
+          "Mapped fusion site: " + entry.fusion_aa + entry.fusion_index_1ind;
+      }
+      var aaMatches = !expectedAa || entry.fusion_aa === expectedAa;
+      var summary = partner.charAt(0).toUpperCase() + partner.slice(1) + " " +
+        entry.parent_aa + entry.parent_index_1ind + " → fusion " +
+        entry.fusion_aa + entry.fusion_index_1ind;
+      var lines = [summary,
+        "Parent: " + entry.parent_aa + entry.parent_index_1ind,
+        "Fusion: " + entry.fusion_aa + entry.fusion_index_1ind,
+        "Amino acid match: " + (aaMatches ? "yes" : "no")];
+      if (entry.is_mutation) lines.push("Note: this aligned pair is a substitution in the fusion.");
+      if (expectedAa && entry.fusion_aa !== expectedAa) {
+        lines.push("Warning: Fusion has " + entry.fusion_aa + entry.fusion_index_1ind +
+          " (not " + expectedAa + ").");
+      }
+      return lines.join("\n");
+    }
+
+    var fEntry = (maps.fusion || {})[String(position)];
+    if (!fEntry) {
+      return "Not in alignment. Fusion residue " + position +
+        " is not covered by the head or tail alignment hits.";
+    }
+    if (expectedAa && fEntry.fusion_aa !== expectedAa) {
+      return "Parent amino acid disagreement. Requested fusion " + expectedAa + position +
+        ", but the fusion sequence has " + fEntry.fusion_aa + " at that position.\n" +
+        "Mapped parent site: " + fEntry.partner + " " + fEntry.parent_aa + fEntry.parent_index_1ind;
+    }
+    return "Fusion " + fEntry.fusion_aa + fEntry.fusion_index_1ind + " → " +
+      fEntry.partner + " " + fEntry.parent_aa + fEntry.parent_index_1ind + "\n" +
+      "Amino acid match: " + ((!expectedAa || fEntry.fusion_aa === expectedAa) ? "yes" : "no");
+  }
+
+  function runQuery() {
+    var select = document.getElementById("rq-fusion");
+    var input = document.getElementById("rq-input");
+    var out = document.getElementById("rq-answer");
+    if (!select || !input || !out) return;
+    var name = select.value;
+    var maps = (window.FUSALIGN_RESIDUE_MAPS || {})[name];
+    if (!maps) {
+      out.textContent = "No residue maps for the selected fusion.";
+      return;
+    }
+    try {
+      var parsed = parseQuery(input.value);
+      out.textContent = queryResidue(maps, parsed.partner, parsed.position, parsed.expected_aa);
+    } catch (err) {
+      out.textContent = "Query error. " + (err && err.message ? err.message : String(err));
+    }
+  }
+
+  function init() {
+    var btn = document.getElementById("rq-run");
+    var input = document.getElementById("rq-input");
+    if (btn) btn.addEventListener("click", runQuery);
+    if (input) input.addEventListener("keydown", function (e) {
+      if (e.key === "Enter") runQuery();
+    });
+  }
+
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", init);
+  } else {
+    init();
+  }
+})();
+"""
+
+
+def residue_query_widget_html(maps_by_name):
+    """Offline residue-query panel + embedded maps JSON for the HTML report."""
+    names = sorted(maps_by_name.keys(), key=lambda s: s.lower())
+    options = "\n".join(
+        f'<option value="{escape(name)}">{escape(name)}</option>' for name in names
+    )
+    maps_json = json.dumps(maps_by_name, separators=(",", ":")).replace("<", "\\u003c")
+    disabled = "disabled" if not names else ""
+    return f"""
+    <section id="residue_query" class="fusion-section">
+      <div class="residue-query-panel">
+        <h3>Residue query</h3>
+        <p>
+          Map a parent or fusion residue without re-aligning.
+          Examples: <code>Tail:Y1078</code>, <code>Head:S12</code>, <code>Fusion:Y200</code>.
+        </p>
+        <div class="residue-query-row">
+          <label for="rq-fusion">Fusion</label>
+          <select id="rq-fusion" {disabled}>
+            {options if options else '<option value="">(no successful fusions)</option>'}
+          </select>
+          <input id="rq-input" type="text" placeholder="Tail:Y1078" {disabled}
+                 aria-label="Residue query" />
+          <button id="rq-run" type="button" {disabled}>Query</button>
+        </div>
+        <div id="rq-answer" class="residue-query-answer"></div>
+      </div>
+    </section>
+    <script type="application/json" id="fusalign-residue-maps">{maps_json}</script>
+    <script>
+      window.FUSALIGN_RESIDUE_MAPS = JSON.parse(
+        document.getElementById("fusalign-residue-maps").textContent
+      );
+    </script>
+    <script>
+    {RESIDUE_QUERY_WIDGET_JS}
+    </script>
+    """
 
 
 def color_bounds(seq, bounds_and_colors):
@@ -813,6 +1425,77 @@ a:hover {
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
 }
+.seq-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px;
+  margin: 8px 0 14px 0;
+  font-size: 13px;
+  color: #334155;
+}
+.legend-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+.legend-swatch {
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  display: inline-block;
+}
+.legend-mut {
+  background: #7c3aed;
+  box-shadow: inset 0 -2px 0 #4c1d95;
+}
+span.mut {
+  color: #7c3aed;
+  font-weight: 600;
+  text-decoration: underline;
+}
+.residue-query-panel {
+  background: #f8fafc;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  padding: 14px 16px;
+  margin: 18px 0 8px 0;
+}
+.residue-query-panel h3 {
+  margin-bottom: 8px;
+}
+.residue-query-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  margin-top: 10px;
+}
+.residue-query-panel select,
+.residue-query-panel input[type="text"] {
+  font-size: 14px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  border: 1px solid #cbd5e1;
+}
+.residue-query-panel input[type="text"] {
+  min-width: 220px;
+}
+.residue-query-panel button {
+  background: #255c99;
+  color: white;
+  border: none;
+  border-radius: 8px;
+  padding: 7px 14px;
+  font-weight: 700;
+  cursor: pointer;
+}
+.residue-query-answer {
+  margin-top: 12px;
+  font-size: 14px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
 .backtop {
   margin-top: 18px;
 }
@@ -862,6 +1545,7 @@ def analyze_one_fusion(
     tail_label="Tail",
     head_color="crimson",
     tail_color="royalblue",
+    mutation_color=MUTATION_COLOR,
     find_kwargs=None,
     decimals=2,
 ):
@@ -897,6 +1581,7 @@ def analyze_one_fusion(
 
         head_mutations = mutations_from_hit(hhit)
         tail_mutations = mutations_from_hit(thit)
+        residue_maps = build_residue_maps(hhit, thit)
 
         hfrag = result["hfrag"]
         tfrag = result["tfrag"]
@@ -923,18 +1608,27 @@ def analyze_one_fusion(
             tail_hit=thit,
             head_color=head_color,
             tail_color=tail_color,
+            mutation_color=mutation_color,
         )
 
         head_html = color_parent_by_hit(
             parent_seq=head_seq,
             hit=hhit,
             color=head_color,
+            mutation_color=mutation_color,
         )
 
         tail_html = color_parent_by_hit(
             parent_seq=tail_seq,
             hit=thit,
             color=tail_color,
+            mutation_color=mutation_color,
+        )
+
+        legend_html = sequence_color_legend_html(
+            head_color,
+            tail_color,
+            mutation_color=mutation_color,
         )
 
         row.update({
@@ -965,10 +1659,12 @@ def analyze_one_fusion(
             "total_tail_mutations": len(tail_mutations),
             "head_mutations_json": json.dumps(head_mutations),
             "tail_mutations_json": json.dumps(tail_mutations),
+            "residue_maps_json": json.dumps(residue_maps),
         })
 
         html = f"""
-        <section id="{html_anchor_id(fusion_name)}" class="fusion-section">
+        <section id="{html_anchor_id(fusion_name)}" class="fusion-section"
+                 data-fusion-name="{escape(str(fusion_name))}">
           <h2>{escape(str(fusion_name))}</h2>
 
           <div class="status">
@@ -1008,6 +1704,7 @@ def analyze_one_fusion(
 
           <div class="sequence-card">
             <h3>Colored sequences</h3>
+            {legend_html}
             <div class="sequence-box">
               <b>Fusion</b><br>
               {fusion_html}<br><br>
@@ -1055,6 +1752,7 @@ def run_fusion_breakpoint_batch(
     display_combined=False,
     head_color="crimson",
     tail_color="royalblue",
+    mutation_color=MUTATION_COLOR,
     find_kwargs=None,
     decimals=2,
 ):
@@ -1086,6 +1784,7 @@ def run_fusion_breakpoint_batch(
             fusion_name=fusion_name,
             head_color=head_color,
             tail_color=tail_color,
+            mutation_color=mutation_color,
             find_kwargs=find_kwargs,
             decimals=decimals,
         )
@@ -1184,6 +1883,12 @@ def run_fusion_breakpoint_batch(
         ) in preview_items
     )
 
+    preview_legend = sequence_color_legend_html(
+        head_color,
+        tail_color,
+        mutation_color=mutation_color,
+    )
+
     combined_html = f"""
     <!DOCTYPE html>
     <html>
@@ -1228,7 +1933,9 @@ def run_fusion_breakpoint_batch(
           <h2>Colored fusion preview</h2>
           <p>
             Compact overview of the predicted head and tail regions within each fusion sequence.
+            Substitutions are purple and underlined.
           </p>
+          {preview_legend}
           <div class="summary-grid">
             {preview_html}
           </div>

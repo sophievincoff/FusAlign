@@ -1,21 +1,27 @@
+import json
+import re
 import tempfile
 from pathlib import Path
 
 import gradio as gr
 import pandas as pd
 
-from fusion_breakpoint_pipeline import run_fusion_breakpoint_batch
+from fusion_breakpoint_pipeline import (
+    format_residue_query_answer,
+    query_residue,
+    run_fusion_breakpoint_batch,
+)
 
 
 EXAMPLE_FUSION_NAME = "LASP1::RBX1"
-EXAMPLE_FUSION_NAME_CSV = ("LASP1::RBX1","APTX::ARL5B")
+EXAMPLE_FUSION_NAME_CSV = ("LASP1::RBX1", "APTX::ARL5B")
 
 EXAMPLE_FUSION = (
     "MNPNCARCGKIVYPTEKVNCLDKFWHKACFHCETCKMTLNMKNYKGYEKKPYCNAHYPKQSFTMVADTPENLRLKQQSELQSQWNAVALWAWDIVVDNCAICRNHIMDLCIECQANQASATSEECTVAWGVCNHAFHFHCISRWLKTRQVCPLDNREWEFQKYGH"
 )
 EXAMPLE_FUSION_CSV = (
     "MNPNCARCGKIVYPTEKVNCLDKFWHKACFHCETCKMTLNMKNYKGYEKKPYCNAHYPKQSFTMVADTPENLRLKQQSELQSQWNAVALWAWDIVVDNCAICRNHIMDLCIECQANQASATSEECTVAWGVCNHAFHFHCISRWLKTRQVCPLDNREWEFQKYGH",
-    "MSNVNLSVSDFWRVMMRVCWLVRQDSRHQRIRLPHLEAVVIGRGPETKITDKKCSRQQVQLKAECNKGYVKVKQVGVNPTSIDSVVIGKDQEVKLQPGQVLHMFIILVVDSIDRERLAITKEELYRMLAHEDLRKAAVLIFANKQDMKGCMTAAEISKYLTLSSIKDHPWHIQSCCALTGEGLCQGLEWMTSRIGVR"
+    "MSNVNLSVSDFWRVMMRVCWLVRQDSRHQRIRLPHLEAVVIGRGPETKITDKKCSRQQVQLKAECNKGYVKVKQVGVNPTSIDSVVIGKDQEVKLQPGQVLHMFIILVVDSIDRERLAITKEELYRMLAHEDLRKAAVLIFANKQDMKGCMTAAEISKYLTLSSIKDHPWHIQSCCALTGEGLCQGLEWMTSRIGVR",
 )
 
 EXAMPLE_HEAD = (
@@ -23,7 +29,7 @@ EXAMPLE_HEAD = (
 )
 EXAMPLE_HEAD_CSV = (
     "MNPNCARCGKIVYPTEKVNCLDKFWHKACFHCETCKMTLNMKNYKGYEKKPYCNAHYPKQSFTMVADTPENLRLKQQSELQSQVRYKEEFEKNKGKGFSVVADTPELQRIKKTQDQISNIKYHEEFEKSRMGPSGGEGMEPERRDSQDGSSYRRPLEQQQPHHIPTSAPVYQQPQQQPVAQSYGGYKEPAAPVSIQRSAPGGGGKRYRAVYDYSAADEDEVSFQDGDTIVNVQQIDDGWMYGTVERTGDTGMLPANYVEAI",
-    "MSNVNLSVSDFWRVMMRVCWLVRQDSRHQRIRLPHLEAVVIGRGPETKITDKKCSRQQVQLKAECNKGYVKVKQVGVNPTSIDSVVIGKDQEVKLQPGQVLHMVNELYPYIVEFEEEAKNPGLETHRKRKRSGNSDSIERDAAQEAEAGTGLEPGSNSGQCSVPLKKGKDAPIKKESLGHWSQGLKISMQDPKMQVYKDEQVVVIKDKYPKARYHWLVLPWTSISSLKAVAREHLELLKHMHTVGEKVIVDFAGSSKLRFRLGYHAIPSMSHVHLHVISQDFDSPCLKNKKHWNSFNTEYFLESQAVIEMVQEAGRVTVRDGMPELLKLPLRCHECQQLLPSIPQLKEHLRKHWTQ"
+    "MSNVNLSVSDFWRVMMRVCWLVRQDSRHQRIRLPHLEAVVIGRGPETKITDKKCSRQQVQLKAECNKGYVKVKQVGVNPTSIDSVVIGKDQEVKLQPGQVLHMVNELYPYIVEFEEEAKNPGLETHRKRKRSGNSDSIERDAAQEAEAGTGLEPGSNSGQCSVPLKKGKDAPIKKESLGHWSQGLKISMQDPKMQVYKDEQVVVIKDKYPKARYHWLVLPWTSISSLKAVAREHLELLKHMHTVGEKVIVDFAGSSKLRFRLGYHAIPSMSHVHLHVISQDFDSPCLKNKKHWNSFNTEYFLESQAVIEMVQEAGRVTVRDGMPELLKLPLRCHECQQLLPSIPQLKEHLRKHWTQ",
 )
 
 EXAMPLE_TAIL = (
@@ -31,7 +37,7 @@ EXAMPLE_TAIL = (
 )
 EXAMPLE_TAIL_CSV = (
     "MAAAMDVDTPSGTNSGAGKKRFEVKKWNAVALWAWDIVVDNCAICRNHIMDLCIECQANQASATSEECTVAWGVCNHAFHFHCISRWLKTRQVCPLDNREWEFQKYGH",
-    "MGLIFAKLWSLFCNQEHKVIIVGLDNAGKTTILYQFLMNEVVHTSPTIGSNVEEIVVKNTHFLMWDIGGQESLRSSWNTYYSNTEFIILVVDSIDRERLAITKEELYRMLAHEDLRKAAVLIFANKQDMKGCMTAAEISKYLTLSSIKDHPWHIQSCCALTGEGLCQGLEWMTSRIGVR"
+    "MGLIFAKLWSLFCNQEHKVIIVGLDNAGKTTILYQFLMNEVVHTSPTIGSNVEEIVVKNTHFLMWDIGGQESLRSSWNTYYSNTEFIILVVDSIDRERLAITKEELYRMLAHEDLRKAAVLIFANKQDMKGCMTAAEISKYLTLSSIKDHPWHIQSCCALTGEGLCQGLEWMTSRIGVR",
 )
 
 
@@ -87,6 +93,78 @@ def _make_single_input_df(fusion_name, fusion_seq, head_seq, tail_seq):
     })
 
 
+def _maps_by_fusion_name(results_df: pd.DataFrame) -> dict:
+    maps = {}
+    if results_df is None or results_df.empty:
+        return maps
+    if "residue_maps_json" not in results_df.columns:
+        return maps
+
+    for _, row in results_df.iterrows():
+        if row.get("status") != "ok":
+            continue
+        raw = row.get("residue_maps_json")
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        try:
+            maps[str(row["fusion_name"])] = (
+                json.loads(raw) if isinstance(raw, str) else raw
+            )
+        except (TypeError, json.JSONDecodeError):
+            continue
+    return maps
+
+
+def _fusion_base_name(name: str) -> str:
+    """Drop duplicate tags added for display (e.g., _seq2)."""
+    return re.sub(r"_seq\d+$", "", str(name))
+
+
+def _partner_aliases_from_fusion_name(fusion_name: str) -> dict:
+    """
+    Build partner aliases from fusion labels like Head::Tail or Head-Tail.
+    """
+    aliases = {}
+    base = _fusion_base_name(fusion_name).strip()
+    if "::" in base:
+        parts = base.split("::", 1)
+    elif "-" in base:
+        parts = base.split("-", 1)
+    else:
+        return aliases
+
+    if len(parts) != 2:
+        return aliases
+
+    head_name = parts[0].strip()
+    tail_name = parts[1].strip()
+    if head_name:
+        aliases[head_name.lower()] = "head"
+    if tail_name:
+        aliases[tail_name.lower()] = "tail"
+    return aliases
+
+
+def _input_signature(input_df: pd.DataFrame, fusion_col, head_col, tail_col, fusion_name_col) -> str:
+    """Stable signature to detect same biological input regardless of colors."""
+    keep = [fusion_name_col, fusion_col, head_col, tail_col]
+    safe_df = input_df[keep].astype(str).copy()
+    return safe_df.to_csv(index=False)
+
+
+def _restyle_html_colors(html_text: str, old_colors: dict, new_colors: dict) -> str:
+    """Fast color-only refresh by replacing previous color literals in generated HTML."""
+    if not old_colors:
+        return html_text
+    out = html_text
+    for key in ("head", "tail", "mutation"):
+        old = old_colors.get(key)
+        new = new_colors.get(key)
+        if old and new and old != new:
+            out = out.replace(str(old), str(new))
+    return out
+
+
 def load_single_example():
     return EXAMPLE_FUSION_NAME, EXAMPLE_FUSION, EXAMPLE_HEAD, EXAMPLE_TAIL
 
@@ -103,6 +181,8 @@ def run_app(
     fusion_name_col,
     head_color,
     tail_color,
+    mutation_color,
+    run_cache,
 ):
     out_dir = Path(tempfile.mkdtemp(prefix="fusion_breakpoint_gradio_"))
 
@@ -118,40 +198,122 @@ def run_app(
             tail_seq=tail_seq,
         )
 
-    results_df, html_path, csv_path = run_fusion_breakpoint_batch(
+    signature = _input_signature(
         input_df,
         fusion_col=fusion_col,
         head_col=head_col,
         tail_col=tail_col,
         fusion_name_col=fusion_name_col,
-        out_dir=out_dir,
-        combined_html_name="fusion_breakpoint_report.html",
-        combined_csv_name="fusion_breakpoint_summary.csv",
-        write_per_fusion_html=True,
-        display_combined=False,
-        head_color=head_color,
-        tail_color=tail_color,
+    )
+    new_colors = {
+        "head": head_color,
+        "tail": tail_color,
+        "mutation": mutation_color,
+    }
+
+    can_fast_refresh = (
+        isinstance(run_cache, dict)
+        and run_cache.get("signature") == signature
+        and run_cache.get("html_path")
+        and run_cache.get("csv_path")
+        and run_cache.get("results_records") is not None
     )
 
-    html_text = Path(html_path).read_text(encoding="utf-8")
+    if can_fast_refresh:
+        results_df = pd.DataFrame(run_cache["results_records"])
+        base_html = Path(run_cache["html_path"]).read_text(encoding="utf-8")
+        html_text = _restyle_html_colors(
+            base_html,
+            old_colors=run_cache.get("colors", {}),
+            new_colors=new_colors,
+        )
+        html_path = out_dir / "fusion_breakpoint_report.html"
+        html_path.write_text(html_text, encoding="utf-8")
+        csv_path = out_dir / "fusion_breakpoint_summary.csv"
+        csv_path.write_text(
+            Path(run_cache["csv_path"]).read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+    else:
+        results_df, html_path, csv_path = run_fusion_breakpoint_batch(
+            input_df,
+            fusion_col=fusion_col,
+            head_col=head_col,
+            tail_col=tail_col,
+            fusion_name_col=fusion_name_col,
+            out_dir=out_dir,
+            combined_html_name="fusion_breakpoint_report.html",
+            combined_csv_name="fusion_breakpoint_summary.csv",
+            write_per_fusion_html=True,
+            display_combined=False,
+            head_color=head_color,
+            tail_color=tail_color,
+            mutation_color=mutation_color,
+        )
+        html_text = Path(html_path).read_text(encoding="utf-8")
 
-    preview_cols = [
-        "fusion_name",
-        "status",
-        "fusion_length",
-        "head_fusion_start_1ind",
-        "head_fusion_end_1ind",
-        "tail_fusion_start_1ind",
-        "tail_fusion_end_1ind",
-        "pct_fusion_from_head",
-        "pct_fusion_from_tail",
-        "total_head_mutations",
-        "total_tail_mutations",
-        "error",
-    ]
-    preview_cols = [c for c in preview_cols if c in results_df.columns]
+    preview_rename = {
+        "fusion_name": "Fusion",
+        "status": "Status",
+        "fusion_length": "Length",
+        "head_fusion_start_1ind": "Head start",
+        "head_fusion_end_1ind": "Head end",
+        "tail_fusion_start_1ind": "Tail start",
+        "tail_fusion_end_1ind": "Tail end",
+        "pct_fusion_from_head": "% head",
+        "pct_fusion_from_tail": "% tail",
+        "total_head_mutations": "Head muts",
+        "total_tail_mutations": "Tail muts",
+        "error": "Error",
+    }
+    preview_cols = [c for c in preview_rename if c in results_df.columns]
+    preview_df = results_df[preview_cols].rename(columns=preview_rename)
 
-    return results_df[preview_cols].copy(), html_text, html_path, csv_path
+    maps = _maps_by_fusion_name(results_df)
+    ok_names = list(maps.keys())
+    fusion_dropdown = gr.update(
+        choices=ok_names,
+        value=ok_names[0] if ok_names else None,
+    )
+
+    return (
+        preview_df,
+        html_text,
+        str(html_path),
+        str(csv_path),
+        maps,
+        fusion_dropdown,
+        "",
+        {
+            "signature": signature,
+            "html_path": str(html_path),
+            "csv_path": str(csv_path),
+            "colors": new_colors,
+            "results_records": results_df.to_dict(orient="records"),
+        },
+    )
+
+
+def run_residue_query(maps_by_name, fusion_name, query_text):
+    if not maps_by_name:
+        return "Run **Generate report** first, then query a residue."
+    if not fusion_name:
+        return "Select a fusion from the dropdown."
+    if fusion_name not in maps_by_name:
+        return f"No residue maps for `{fusion_name}`."
+    if not query_text or not str(query_text).strip():
+        return (
+            "Enter a query such as `Tail:Y1078`, `Tail:1078-1085`, "
+            "`Head:S12`, `Fusion:Y200`, or partner alias like `ALK:Y1078`."
+        )
+
+    partner_aliases = _partner_aliases_from_fusion_name(fusion_name)
+    answer = query_residue(
+        maps_by_name[fusion_name],
+        query_text=query_text,
+        partner_aliases=partner_aliases,
+    )
+    return format_residue_query_answer(answer)
 
 
 with gr.Blocks(
@@ -170,8 +332,32 @@ with gr.Blocks(
         color: #475569;
         font-size: 1rem;
     }
+    #summary-preview {
+        overflow-x: auto;
+    }
+    #summary-preview table {
+        table-layout: auto;
+        width: max-content;
+        min-width: 100%;
+        border-collapse: collapse;
+    }
+    #summary-preview th,
+    #summary-preview td {
+        white-space: nowrap !important;
+        padding: 10px 14px !important;
+        font-size: 13px !important;
+        line-height: 1.35 !important;
+        vertical-align: middle !important;
+    }
+    #summary-preview th {
+        font-weight: 700 !important;
+        letter-spacing: 0.01em;
+    }
     """
 ) as demo:
+    residue_maps_state = gr.State({})
+    run_cache_state = gr.State({})
+
     gr.HTML(
         """
         <div id="title-block">
@@ -240,8 +426,9 @@ with gr.Blocks(
 
     with gr.Accordion("Display options", open=False):
         with gr.Row():
-            head_color = gr.Textbox(label="Head color", value="crimson")
-            tail_color = gr.Textbox(label="Tail color", value="royalblue")
+            head_color = gr.ColorPicker(label="Head color", value="#dc143c")
+            tail_color = gr.ColorPicker(label="Tail color", value="#4169e1")
+            mutation_color = gr.ColorPicker(label="Mutation color", value="#7c3aed")
 
     with gr.Row():
         run_button = gr.Button("Generate report", variant="primary")
@@ -253,7 +440,8 @@ with gr.Blocks(
     results_preview = gr.Dataframe(
         label="Summary preview",
         interactive=False,
-        wrap=True,
+        wrap=False,
+        elem_id="summary-preview",
     )
 
     html_preview = gr.HTML(label="HTML report preview")
@@ -261,6 +449,32 @@ with gr.Blocks(
     with gr.Row():
         html_download = gr.File(label="Download combined HTML report")
         csv_download = gr.File(label="Download summary CSV")
+
+    gr.Markdown(
+        """
+        ## Residue query
+        After a successful run, map a parent or fusion residue without re-aligning.
+        Syntax examples:
+        `Tail:Y1078`, `Tail:1078-1085`,
+        `Head:S12`, `Fusion:Y200`, or aliases like `ALK:Y1078` when the fusion name
+        is `Head::Tail` or `Head-Tail`.
+        """
+    )
+    with gr.Row():
+        query_fusion = gr.Dropdown(
+            label="Fusion",
+            choices=[],
+            value=None,
+            interactive=True,
+        )
+        query_text = gr.Textbox(
+            label="Residue query",
+            placeholder="Tail:Y1078",
+            scale=2,
+        )
+        query_button = gr.Button("Query", variant="secondary")
+
+    query_answer = gr.Markdown(value="")
 
     load_example_button.click(
         fn=load_single_example,
@@ -287,13 +501,30 @@ with gr.Blocks(
             fusion_name_col,
             head_color,
             tail_color,
+            mutation_color,
+            run_cache_state,
         ],
         outputs=[
             results_preview,
             html_preview,
             html_download,
             csv_download,
+            residue_maps_state,
+            query_fusion,
+            query_answer,
+            run_cache_state,
         ],
+    )
+
+    query_button.click(
+        fn=run_residue_query,
+        inputs=[residue_maps_state, query_fusion, query_text],
+        outputs=[query_answer],
+    )
+    query_text.submit(
+        fn=run_residue_query,
+        inputs=[residue_maps_state, query_fusion, query_text],
+        outputs=[query_answer],
     )
 
     cancel_button.click(
